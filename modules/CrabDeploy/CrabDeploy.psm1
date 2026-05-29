@@ -1,4 +1,4 @@
-# CrabDeploy - shared deploy helpers for the App01-vm-prod-eus2 self-hosted runner.
+# CrabDeploy - shared deploy helpers for a self-hosted Windows GitHub Actions runner.
 # Phase 1 scope: Angular -> IIS static site. Console/msbuild helpers come in later phases.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
