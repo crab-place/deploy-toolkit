@@ -79,7 +79,8 @@ function Deploy-Angular-IIS {
         [int]$Retention = 3,
         [string]$SmokeUrl = 'http://localhost/',
         [string]$SmokeHostHeader,
-        [string[]]$Preserve = @('web.config')
+        [string[]]$PreserveFiles = @('web.config'),
+        [string[]]$PreserveDirs  = @()
     )
 
     if (-not (Test-Path -LiteralPath (Join-Path $ArtifactDir 'index.html'))) {
@@ -100,8 +101,12 @@ function Deploy-Angular-IIS {
     try {
         New-Item -ItemType Directory -Path $SiteFolder -Force | Out-Null
         $rc = @($ArtifactDir, $SiteFolder, '/MIR','/NFL','/NDL','/NJH','/NJS','/NP','/R:2','/W:2')
-        foreach ($f in $Preserve) { $rc += '/XF'; $rc += $f }
-        Write-Host "Deploy: '$ArtifactDir' -> '$SiteFolder' (preserving: $($Preserve -join ', '))"
+        foreach ($f in $PreserveFiles) { $rc += '/XF'; $rc += $f }
+        foreach ($d in $PreserveDirs)  { $rc += '/XD'; $rc += $d }
+        $log = @()
+        if ($PreserveFiles) { $log += "files: $($PreserveFiles -join ', ')" }
+        if ($PreserveDirs)  { $log += "dirs: $($PreserveDirs -join ', ')" }
+        Write-Host "Deploy: '$ArtifactDir' -> '$SiteFolder' (preserving $($log -join '; '))"
         robocopy @rc | Out-Null
         if ($LASTEXITCODE -ge 8) { throw "robocopy deploy failed (exit $LASTEXITCODE)" }
         $global:LASTEXITCODE = 0
