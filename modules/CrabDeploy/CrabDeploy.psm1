@@ -1,5 +1,5 @@
 # CrabDeploy - shared deploy helpers for a self-hosted Windows GitHub Actions runner.
-# Phase 1 scope: Angular -> IIS static site. Console/msbuild helpers come in later phases.
+# Phase 1 scope: Angular -> IIS static site. Phase 2 adds .NET WebApi -> IIS bin swap.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -130,4 +130,70 @@ function Deploy-Angular-IIS {
     Write-Host "Deploy-Angular-IIS complete for '$Name'."
 }
 
-Export-ModuleMember -Function Backup-AppFolder, Rotate-Backups, Test-Smoke, Deploy-Angular-IIS
+function Deploy-DotNetWebApp-IIS {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ArtifactDir,    # folder of build output - DLLs at root
+        [Parameter(Mandatory)][string]$SiteFolder,     # IIS site root (parent of bin\)
+        [Parameter(Mandatory)][string]$AppPool,
+        [Parameter(Mandatory)][string]$BackupRoot,
+        [Parameter(Mandatory)][string]$Name,
+        [int]$Retention = 3,
+        [string]$SmokeUrl = 'http://localhost/',
+        [string]$SmokeHostHeader
+    )
+
+    # Artifact sanity - must have at least one .dll
+    $dlls = @(Get-ChildItem -Path $ArtifactDir -Filter *.dll -File -ErrorAction SilentlyContinue)
+    if ($dlls.Count -eq 0) {
+        throw "Artifact '$ArtifactDir' contains no .dll files - wrong path or empty build?"
+    }
+    Write-Host "Artifact has $($dlls.Count) .dll files."
+
+    Import-Module WebAdministration -ErrorAction Stop
+
+    $siteBin    = Join-Path $SiteFolder 'bin'
+    $backupName = "$Name-bin"
+
+    # Backup ONLY the bin folder (not the whole site - Web.config, App_Data etc. stay put)
+    $backup = Backup-AppFolder -SiteFolder $siteBin -BackupRoot $BackupRoot -Name $backupName
+    Rotate-Backups -BackupRoot $BackupRoot -Name $backupName -Keep $Retention
+
+    # Stop pool to release locks on running DLLs
+    if ((Get-WebAppPoolState -Name $AppPool).Value -ne 'Stopped') {
+        Write-Host "Stopping app pool '$AppPool'"
+        Stop-WebAppPool -Name $AppPool
+        Start-Sleep -Seconds 2
+    }
+
+    try {
+        New-Item -ItemType Directory -Path $siteBin -Force | Out-Null
+        # ADDITIVE recursive copy: overwrite existing, add new, NEVER delete.
+        # Preserves manually-placed files in prod bin\ (e.g. GA4_Credential).
+        Write-Host "Copy: '$ArtifactDir' -> '$siteBin' (additive, recursive, no purge)"
+        robocopy $ArtifactDir $siteBin /E /NFL /NDL /NJH /NJS /NP /R:2 /W:2 | Out-Null
+        if ($LASTEXITCODE -ge 8) { throw "robocopy deploy failed (exit $LASTEXITCODE)" }
+        $global:LASTEXITCODE = 0
+    }
+    catch {
+        Write-Host "Deploy failed: $($_.Exception.Message)"
+        if ($backup) {
+            # Rollback /MIR restores bin\ exactly to the pre-deploy snapshot
+            # (including any manually-placed files we backed up).
+            Write-Host "Rolling back bin from '$backup'"
+            robocopy $backup $siteBin /MIR /NFL /NDL /NJH /NJS /NP /R:2 /W:2 | Out-Null
+            $global:LASTEXITCODE = 0
+        }
+        Start-WebAppPool -Name $AppPool -ErrorAction SilentlyContinue
+        throw
+    }
+
+    Write-Host "Starting app pool '$AppPool'"
+    Start-WebAppPool -Name $AppPool
+    Start-Sleep -Seconds 2
+
+    Test-Smoke -Url $SmokeUrl -HostHeader $SmokeHostHeader
+    Write-Host "Deploy-DotNetWebApp-IIS complete for '$Name'."
+}
+
+Export-ModuleMember -Function Backup-AppFolder, Rotate-Backups, Test-Smoke, Deploy-Angular-IIS, Deploy-DotNetWebApp-IIS
