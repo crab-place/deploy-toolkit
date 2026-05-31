@@ -151,6 +151,7 @@ function Deploy-DotNetWebApp-IIS {
         [int]$Retention = 3,
         [string]$SmokeUrl = 'http://localhost/',
         [string]$SmokeHostHeader,
+        [string]$SmokeBodyMatch,                   # Optional body regex for the primary smoke
         [hashtable[]]$ExtraSmokes = @()    # Each: @{ Url = '...'; BodyMatch = '...' (optional) }
     )
 
@@ -187,8 +188,13 @@ function Deploy-DotNetWebApp-IIS {
         Start-WebAppPool -Name $AppPool
         Start-Sleep -Seconds 2
 
-        # Primary smoke
-        Test-Smoke -Url $SmokeUrl -HostHeader $SmokeHostHeader
+        # Primary smoke (can include a body match - useful when the canonical health endpoint
+        # returns content that proves the API is actually alive, not just listening)
+        if ($SmokeBodyMatch) {
+            Test-Smoke -Url $SmokeUrl -HostHeader $SmokeHostHeader -BodyMatch $SmokeBodyMatch
+        } else {
+            Test-Smoke -Url $SmokeUrl -HostHeader $SmokeHostHeader
+        }
 
         # Extra smokes (e.g. shipping endpoint with body match) - any failure triggers rollback
         foreach ($s in $ExtraSmokes) {
