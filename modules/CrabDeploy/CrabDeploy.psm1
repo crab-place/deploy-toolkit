@@ -48,22 +48,32 @@ function Test-Smoke {
         [int]$ExpectStatus = 200,
         [int]$Retries = 5,
         [int]$DelaySec = 3,
-        [string]$HostHeader
+        [string]$HostHeader,
+        [string]$BodyMatch        # Optional regex - response body must match this in addition to status
     )
     $headers = @{}
     if ($HostHeader) { $headers['Host'] = $HostHeader }
     for ($i = 1; $i -le $Retries; $i++) {
         try {
             $resp = Invoke-WebRequest -Uri $Url -Headers $headers -UseBasicParsing -TimeoutSec 30
-            if ($resp.StatusCode -eq $ExpectStatus) {
-                Write-Host "Smoke OK: $Url -> $($resp.StatusCode)"
-                return
+            if ($resp.StatusCode -ne $ExpectStatus) {
+                Write-Host "Smoke attempt $i/$Retries -> got $($resp.StatusCode), want $ExpectStatus"
+                Start-Sleep -Seconds $DelaySec
+                continue
             }
-            Write-Host "Smoke attempt $i/$Retries -> got $($resp.StatusCode), want $ExpectStatus"
+            if ($BodyMatch -and ($resp.Content -notmatch $BodyMatch)) {
+                $preview = if ($resp.Content) { ($resp.Content.Substring(0, [Math]::Min(200, $resp.Content.Length))) } else { '(empty body)' }
+                Write-Host "Smoke attempt $i/$Retries -> status OK but body does not match '$BodyMatch'. First 200 chars: $preview"
+                Start-Sleep -Seconds $DelaySec
+                continue
+            }
+            $detail = if ($BodyMatch) { " + body match '$BodyMatch'" } else { '' }
+            Write-Host "Smoke OK: $Url -> $($resp.StatusCode)$detail"
+            return
         } catch {
             Write-Host "Smoke attempt $i/$Retries failed: $($_.Exception.Message)"
+            Start-Sleep -Seconds $DelaySec
         }
-        Start-Sleep -Seconds $DelaySec
     }
     throw "Smoke test failed after $Retries attempts: $Url"
 }
@@ -133,17 +143,17 @@ function Deploy-Angular-IIS {
 function Deploy-DotNetWebApp-IIS {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$ArtifactDir,    # folder of build output - DLLs at root
-        [Parameter(Mandatory)][string]$SiteFolder,     # IIS site root (parent of bin\)
+        [Parameter(Mandatory)][string]$ArtifactDir,
+        [Parameter(Mandatory)][string]$SiteFolder,
         [Parameter(Mandatory)][string]$AppPool,
         [Parameter(Mandatory)][string]$BackupRoot,
         [Parameter(Mandatory)][string]$Name,
         [int]$Retention = 3,
         [string]$SmokeUrl = 'http://localhost/',
-        [string]$SmokeHostHeader
+        [string]$SmokeHostHeader,
+        [hashtable[]]$ExtraSmokes = @()    # Each: @{ Url = '...'; BodyMatch = '...' (optional) }
     )
 
-    # Artifact sanity - must have at least one .dll
     $dlls = @(Get-ChildItem -Path $ArtifactDir -Filter *.dll -File -ErrorAction SilentlyContinue)
     if ($dlls.Count -eq 0) {
         throw "Artifact '$ArtifactDir' contains no .dll files - wrong path or empty build?"
@@ -155,11 +165,9 @@ function Deploy-DotNetWebApp-IIS {
     $siteBin    = Join-Path $SiteFolder 'bin'
     $backupName = "$Name-bin"
 
-    # Backup ONLY the bin folder (not the whole site - Web.config, App_Data etc. stay put)
     $backup = Backup-AppFolder -SiteFolder $siteBin -BackupRoot $BackupRoot -Name $backupName
     Rotate-Backups -BackupRoot $BackupRoot -Name $backupName -Keep $Retention
 
-    # Stop pool to release locks on running DLLs
     if ((Get-WebAppPoolState -Name $AppPool).Value -ne 'Stopped') {
         Write-Host "Stopping app pool '$AppPool'"
         Stop-WebAppPool -Name $AppPool
@@ -167,32 +175,47 @@ function Deploy-DotNetWebApp-IIS {
     }
 
     try {
+        # Additive recursive copy - preserves anything in prod bin\ not in the build (GA4_Credential, etc.)
         New-Item -ItemType Directory -Path $siteBin -Force | Out-Null
-        # ADDITIVE recursive copy: overwrite existing, add new, NEVER delete.
-        # Preserves manually-placed files in prod bin\ (e.g. GA4_Credential).
         Write-Host "Copy: '$ArtifactDir' -> '$siteBin' (additive, recursive, no purge)"
         robocopy $ArtifactDir $siteBin /E /NFL /NDL /NJH /NJS /NP /R:2 /W:2 | Out-Null
         if ($LASTEXITCODE -ge 8) { throw "robocopy deploy failed (exit $LASTEXITCODE)" }
         $global:LASTEXITCODE = 0
+
+        # Start pool inside try - if it fails, rollback path triggers
+        Write-Host "Starting app pool '$AppPool'"
+        Start-WebAppPool -Name $AppPool
+        Start-Sleep -Seconds 2
+
+        # Primary smoke
+        Test-Smoke -Url $SmokeUrl -HostHeader $SmokeHostHeader
+
+        # Extra smokes (e.g. shipping endpoint with body match) - any failure triggers rollback
+        foreach ($s in $ExtraSmokes) {
+            $u = $s['Url']
+            $bm = if ($s.ContainsKey('BodyMatch')) { $s['BodyMatch'] } else { $null }
+            if ($bm) {
+                Test-Smoke -Url $u -HostHeader $SmokeHostHeader -BodyMatch $bm
+            } else {
+                Test-Smoke -Url $u -HostHeader $SmokeHostHeader
+            }
+        }
     }
     catch {
-        Write-Host "Deploy failed: $($_.Exception.Message)"
+        Write-Host "Deploy or smoke check failed: $($_.Exception.Message)"
         if ($backup) {
-            # Rollback /MIR restores bin\ exactly to the pre-deploy snapshot
-            # (including any manually-placed files we backed up).
-            Write-Host "Rolling back bin from '$backup'"
+            Write-Host "Rolling back bin from '$backup' (stop pool, restore, restart pool)."
+            try { Stop-WebAppPool -Name $AppPool -ErrorAction Stop; Start-Sleep -Seconds 2 } catch { Write-Host "  (pool stop during rollback: $($_.Exception.Message))" }
             robocopy $backup $siteBin /MIR /NFL /NDL /NJH /NJS /NP /R:2 /W:2 | Out-Null
             $global:LASTEXITCODE = 0
+            try { Start-WebAppPool -Name $AppPool -ErrorAction Stop; Start-Sleep -Seconds 2 } catch { Write-Host "  (pool start during rollback: $($_.Exception.Message))" }
+        } else {
+            Write-Host "No backup available (first deploy?) - cannot roll back automatically."
+            Start-WebAppPool -Name $AppPool -ErrorAction SilentlyContinue
         }
-        Start-WebAppPool -Name $AppPool -ErrorAction SilentlyContinue
         throw
     }
 
-    Write-Host "Starting app pool '$AppPool'"
-    Start-WebAppPool -Name $AppPool
-    Start-Sleep -Seconds 2
-
-    Test-Smoke -Url $SmokeUrl -HostHeader $SmokeHostHeader
     Write-Host "Deploy-DotNetWebApp-IIS complete for '$Name'."
 }
 
