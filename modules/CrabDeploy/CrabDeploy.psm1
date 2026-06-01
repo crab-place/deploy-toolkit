@@ -326,9 +326,18 @@ function Deploy-DotnetConsole-Scheduled {
             if (-not (Test-Path -LiteralPath $mainExePath)) {
                 throw "Direct smoke: expected exe '$mainExeName' not found in '$SiteFolder' after deploy"
             }
-            Write-Host "Smoke: running '$mainExePath' $($SmokeDirectArgs -join ' ')"
-            & $mainExePath @SmokeDirectArgs
-            $directExit = $LASTEXITCODE
+            # Run with CWD = SiteFolder so log4net (and any other relative-path resource
+            # the exe uses) resolves the same way the scheduled task does in prod. Without
+            # this, an exe configured to log to "FedExZipImporter.log" writes to the
+            # runner's working dir instead of the prod log file, and log-marker smoke fails.
+            Write-Host "Smoke: running '$mainExePath' $($SmokeDirectArgs -join ' ') (CWD=$SiteFolder)"
+            Push-Location -LiteralPath $SiteFolder
+            try {
+                & $mainExePath @SmokeDirectArgs
+                $directExit = $LASTEXITCODE
+            } finally {
+                Pop-Location
+            }
             $global:LASTEXITCODE = 0
             if ($directExit -ne 0) {
                 throw "Direct smoke failed: '$mainExeName $($SmokeDirectArgs -join ' ')' returned exit $directExit"
