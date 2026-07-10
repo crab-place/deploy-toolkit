@@ -371,18 +371,7 @@ function Deploy-DotnetConsole-Scheduled {
             $results = @{}
             $foundMarkers = @{}
             while ((Get-Date) -lt $smokeDeadline) {
-                $allDone = $true
-                foreach ($task in $TaskNames) {
-                    if ($results.ContainsKey($task)) { continue }
-                    $state = (Get-ScheduledTask -TaskName $task).State
-                    $info = Get-ScheduledTaskInfo -TaskName $task
-                    if ($state -eq 'Ready' -and $info.LastRunTime -ge $smokeStart) {
-                        $results[$task] = $info.LastTaskResult
-                        Write-Host "Smoke: task '$task' completed with LastTaskResult=$($info.LastTaskResult)"
-                    } else {
-                        $allDone = $false
-                    }
-                }
+                # Refresh markers FIRST so run-evidence is current for the task check below.
                 if ($LogMarkers.Count -gt 0) {
                     $newContent = Get-NewLogContentInternal -LogDir $effectiveLogDir -BeforeName $logBeforeName -BeforeSize $logBeforeSize -LogFilePattern $LogFilePattern
                     foreach ($m in $LogMarkers) {
@@ -391,8 +380,30 @@ function Deploy-DotnetConsole-Scheduled {
                             Write-Host "Smoke: log marker found: '$m'"
                         }
                     }
-                    if ($foundMarkers.Count -lt $LogMarkers.Count) { $allDone = $false }
                 }
+                # Every configured end-marker appearing in NEWLY-appended log content proves each
+                # task ran to the end of Main during this window - a more reliable completion signal
+                # than LastRunTime, which the task's own schedule can suppress: a scheduled instance
+                # already running makes our manual Start-ScheduledTask a no-op (MultipleInstances=
+                # IgnoreNew), so LastRunTime never advances past smokeStart even though the task ran
+                # and exited cleanly. Accept markers as run-evidence; fall back to LastRunTime when
+                # a caller configured no markers.
+                $markersProveRun = ($LogMarkers.Count -gt 0 -and $foundMarkers.Count -ge $LogMarkers.Count)
+
+                $allDone = $true
+                foreach ($task in $TaskNames) {
+                    if ($results.ContainsKey($task)) { continue }
+                    $state = (Get-ScheduledTask -TaskName $task).State
+                    $info = Get-ScheduledTaskInfo -TaskName $task
+                    $ranThisWindow = ($info.LastRunTime -ge $smokeStart)
+                    if ($state -eq 'Ready' -and ($ranThisWindow -or $markersProveRun)) {
+                        $results[$task] = $info.LastTaskResult
+                        Write-Host "Smoke: task '$task' completed with LastTaskResult=$($info.LastTaskResult)"
+                    } else {
+                        $allDone = $false
+                    }
+                }
+                if ($LogMarkers.Count -gt 0 -and $foundMarkers.Count -lt $LogMarkers.Count) { $allDone = $false }
                 if ($allDone) { break }
                 Start-Sleep -Seconds 3
             }
