@@ -468,4 +468,108 @@ function Deploy-DotnetConsole-Scheduled {
     Write-Host "Deploy-DotnetConsole-Scheduled complete for '$Name'."
 }
 
-Export-ModuleMember -Function Backup-AppFolder, Rotate-Backups, Test-Smoke, Deploy-Angular-IIS, Deploy-DotNetWebApp-IIS, Deploy-DotnetConsole-Scheduled
+
+function Deploy-AspNetCore-IIS {
+    <#
+    .SYNOPSIS
+    Deploy an SDK-style ASP.NET Core app (net6.0+) to an IIS site.
+
+    .DESCRIPTION
+    Unlike Deploy-DotNetWebApp-IIS (which swaps <SiteFolder>\bin for .NET Framework
+    apps), a `dotnet publish` payload is FLAT and belongs at the site ROOT: the app
+    dll sits next to web.config, appsettings*.json and wwwroot\. Copying it into bin\
+    would leave the site running its old files and report success.
+
+    Assumes ANCM V2 + the ASP.NET Core hosting bundle are installed. Works for both
+    inprocess and outofprocess hostingModel: the app pool is stopped before the copy,
+    which releases the file locks w3wp holds under inprocess.
+
+    Copy is additive (/E, no purge) to match the house pattern - it never deletes
+    server-side files the artifact does not know about (e.g. logs\).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ArtifactDir,
+        [Parameter(Mandatory)][string]$SiteFolder,
+        [Parameter(Mandatory)][string]$AppPool,
+        [Parameter(Mandatory)][string]$BackupRoot,
+        [Parameter(Mandatory)][string]$Name,
+        [int]$Retention = 3,
+        [string]$SmokeUrl = 'http://localhost/',
+        [string]$SmokeHostHeader,
+        [string]$SmokeBodyMatch,
+        [hashtable[]]$ExtraSmokes = @(),
+        [string[]]$PreserveDirs = @('logs')
+    )
+
+    # Validate the artifact really is a published ASP.NET Core root, not a bin folder
+    # or an empty/incorrect path. web.config carries the aspNetCore handler; without it
+    # IIS would serve the payload as static files.
+    $dlls = @(Get-ChildItem -Path $ArtifactDir -Filter *.dll -File -ErrorAction SilentlyContinue)
+    if ($dlls.Count -eq 0) {
+        throw "Artifact '$ArtifactDir' contains no .dll files - wrong path or empty build?"
+    }
+    $webConfig = Join-Path $ArtifactDir 'web.config'
+    if (-not (Test-Path -LiteralPath $webConfig)) {
+        throw "Artifact '$ArtifactDir' has no web.config - not a published ASP.NET Core app (did you run 'dotnet publish'?)."
+    }
+    if ((Get-Content -LiteralPath $webConfig -Raw) -notmatch 'AspNetCoreModuleV2') {
+        throw "Artifact web.config has no AspNetCoreModuleV2 handler - unexpected publish output."
+    }
+    Write-Host "Artifact has $($dlls.Count) .dll files + a valid ASP.NET Core web.config."
+
+    Import-Module WebAdministration -ErrorAction Stop
+
+    $backup = Backup-AppFolder -SiteFolder $SiteFolder -BackupRoot $BackupRoot -Name $Name -ExcludeDirs $PreserveDirs
+    Rotate-Backups -BackupRoot $BackupRoot -Name $Name -Keep $Retention
+
+    if ((Get-WebAppPoolState -Name $AppPool).Value -ne 'Stopped') {
+        Write-Host "Stopping app pool '$AppPool'"
+        Stop-WebAppPool -Name $AppPool
+        Start-Sleep -Seconds 2
+    }
+
+    try {
+        New-Item -ItemType Directory -Path $SiteFolder -Force | Out-Null
+        Write-Host "Copy: '$ArtifactDir' -> '$SiteFolder' (root, additive, recursive, no purge)"
+        robocopy $ArtifactDir $SiteFolder /E /NFL /NDL /NJH /NJS /NP /R:2 /W:2 | Out-Null
+        if ($LASTEXITCODE -ge 8) { throw "robocopy deploy failed (exit $LASTEXITCODE)" }
+        $global:LASTEXITCODE = 0
+
+        Write-Host "Starting app pool '$AppPool'"
+        Start-WebAppPool -Name $AppPool
+        Start-Sleep -Seconds 2
+
+        if ($SmokeBodyMatch) {
+            Test-Smoke -Url $SmokeUrl -HostHeader $SmokeHostHeader -BodyMatch $SmokeBodyMatch
+        } else {
+            Test-Smoke -Url $SmokeUrl -HostHeader $SmokeHostHeader
+        }
+        foreach ($s in $ExtraSmokes) {
+            $u  = $s['Url']
+            $bm = if ($s.ContainsKey('BodyMatch')) { $s['BodyMatch'] } else { $null }
+            if ($bm) { Test-Smoke -Url $u -HostHeader $SmokeHostHeader -BodyMatch $bm }
+            else     { Test-Smoke -Url $u -HostHeader $SmokeHostHeader }
+        }
+    }
+    catch {
+        Write-Host "Deploy or smoke check failed: $($_.Exception.Message)"
+        if ($backup) {
+            Write-Host "Rolling back site root from '$backup' (stop pool, restore, restart pool)."
+            try { Stop-WebAppPool -Name $AppPool -ErrorAction Stop; Start-Sleep -Seconds 2 } catch { Write-Host "  (pool stop during rollback: $($_.Exception.Message))" }
+            $rc = @($backup, $SiteFolder, '/MIR','/NFL','/NDL','/NJH','/NJS','/NP','/R:2','/W:2')
+            foreach ($d in $PreserveDirs) { $rc += '/XD'; $rc += (Join-Path $SiteFolder $d) }
+            robocopy @rc | Out-Null
+            $global:LASTEXITCODE = 0
+            try { Start-WebAppPool -Name $AppPool -ErrorAction Stop; Start-Sleep -Seconds 2 } catch { Write-Host "  (pool start during rollback: $($_.Exception.Message))" }
+        } else {
+            Write-Host "No backup available (first deploy?) - cannot roll back automatically."
+            Start-WebAppPool -Name $AppPool -ErrorAction SilentlyContinue
+        }
+        throw
+    }
+
+    Write-Host "Deploy-AspNetCore-IIS complete for '$Name'."
+}
+
+Export-ModuleMember -Function Backup-AppFolder, Rotate-Backups, Test-Smoke, Deploy-Angular-IIS, Deploy-DotNetWebApp-IIS, Deploy-AspNetCore-IIS, Deploy-DotnetConsole-Scheduled
