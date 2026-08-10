@@ -88,6 +88,112 @@ function Test-Smoke {
     throw "Smoke test failed after $Retries attempts: $Url"
 }
 
+function Get-AppPoolStateSafe {
+    <#
+    .SYNOPSIS
+    Current app-pool state, or 'Unknown' when IIS will not answer.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$AppPool)
+    try { return (Get-WebAppPoolState -Name $AppPool).Value } catch { return 'Unknown' }
+}
+
+function Stop-AppPoolAndWait {
+    <#
+    .SYNOPSIS
+    Stop an app pool and block until it is really 'Stopped'.
+
+    .DESCRIPTION
+    IIS reports a pool as 'Stopping' while its worker drains. Any control message
+    sent during that window - Start-WebAppPool, or a second Stop-WebAppPool - throws
+    "The service cannot accept control messages at this time" (HRESULT 0x80070425).
+    Because Stop -> copy -> Start ran back-to-back, a slow-shutdown worker failed the
+    deploy AND then failed the rollback that followed it, leaving the pool wedged.
+
+    So: ask it to stop, wait for the state to actually settle, and only if the worker
+    refuses to die inside -GracefulSec, kill the w3wp belonging to THIS pool (matched
+    on the -ap argument, so a sibling pool's worker is never touched).
+
+    Throws if the pool will not reach 'Stopped' - callers must not swap files under a
+    live worker.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$AppPool,
+        [int]$GracefulSec = 45,
+        [int]$PostKillSec = 20
+    )
+    Import-Module WebAdministration -ErrorAction Stop
+    $state = Get-AppPoolStateSafe -AppPool $AppPool
+    if ($state -eq 'Stopped') { Write-Host "App pool '$AppPool' already Stopped."; return }
+    Write-Host "Stopping app pool '$AppPool' (state=$state, graceful window ${GracefulSec}s)"
+    # A pool already in 'Stopping' rejects this call - not a failure, the wait decides.
+    try { Stop-WebAppPool -Name $AppPool -ErrorAction Stop }
+    catch { Write-Host "  (Stop-WebAppPool: $($_.Exception.Message))" }
+    $deadline = (Get-Date).AddSeconds($GracefulSec)
+    while ((Get-AppPoolStateSafe -AppPool $AppPool) -ne 'Stopped' -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 3
+    }
+    if ((Get-AppPoolStateSafe -AppPool $AppPool) -ne 'Stopped') {
+        Write-Host "Pool still '$(Get-AppPoolStateSafe -AppPool $AppPool)' after ${GracefulSec}s - force-killing its worker(s)."
+        $procIds = @()
+        try {
+            $procIds += @(Get-ChildItem "IIS:\AppPools\$AppPool\WorkerProcesses" -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.processId })
+        } catch { Write-Host "  (WorkerProcesses lookup: $($_.Exception.Message))" }
+        try {
+            $procIds += @(Get-CimInstance Win32_Process -Filter "Name='w3wp.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape("-ap `"$AppPool`"") } |
+                ForEach-Object { $_.ProcessId })
+        } catch { Write-Host "  (Win32_Process lookup: $($_.Exception.Message))" }
+        $procIds = @($procIds | Where-Object { $_ } | Sort-Object -Unique)
+        if ($procIds.Count -eq 0) { Write-Host "  (no w3wp worker found for '$AppPool')" }
+        foreach ($procId in $procIds) {
+            try { Stop-Process -Id $procId -Force -ErrorAction Stop; Write-Host "  killed w3wp PID $procId" }
+            catch { Write-Host "  kill PID ${procId} failed: $($_.Exception.Message)" }
+        }
+        $deadline2 = (Get-Date).AddSeconds($PostKillSec)
+        while ((Get-AppPoolStateSafe -AppPool $AppPool) -ne 'Stopped' -and (Get-Date) -lt $deadline2) {
+            Start-Sleep -Seconds 2
+        }
+    }
+    $final = Get-AppPoolStateSafe -AppPool $AppPool
+    if ($final -ne 'Stopped') {
+        throw "App pool '$AppPool' would not stop (state=$final) - refusing to swap files under a live worker."
+    }
+    Write-Host "App pool '$AppPool' is Stopped."
+}
+
+function Start-AppPoolAndWait {
+    <#
+    .SYNOPSIS
+    Start an app pool and block until it reports 'Started'.
+
+    .DESCRIPTION
+    The mirror of Stop-AppPoolAndWait: a Start issued while the pool is still
+    transitioning is silently dropped (or throws 0x80070425), so poll the state and
+    re-issue until it takes. Throws if the pool never reaches 'Started', which lets
+    the caller's catch block roll back rather than smoke-test a dead site.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$AppPool,
+        [int]$TimeoutSec = 30
+    )
+    Import-Module WebAdministration -ErrorAction Stop
+    Write-Host "Starting app pool '$AppPool'"
+    try { Start-WebAppPool -Name $AppPool -ErrorAction Stop }
+    catch { Write-Host "  (Start-WebAppPool: $($_.Exception.Message))" }
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-AppPoolStateSafe -AppPool $AppPool) -ne 'Started' -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 3
+        try { Start-WebAppPool -Name $AppPool -ErrorAction Stop } catch { }
+    }
+    $final = Get-AppPoolStateSafe -AppPool $AppPool
+    if ($final -ne 'Started') { throw "App pool '$AppPool' did not reach Started (state=$final)." }
+    Write-Host "App pool '$AppPool' is Started."
+}
+
 function Deploy-Angular-IIS {
     [CmdletBinding()]
     param(
@@ -108,11 +214,7 @@ function Deploy-Angular-IIS {
     Import-Module WebAdministration -ErrorAction Stop
     $backup = Backup-AppFolder -SiteFolder $SiteFolder -BackupRoot $BackupRoot -Name $Name
     Rotate-Backups -BackupRoot $BackupRoot -Name $Name -Keep $Retention
-    if ((Get-WebAppPoolState -Name $AppPool).Value -ne 'Stopped') {
-        Write-Host "Stopping app pool '$AppPool'"
-        Stop-WebAppPool -Name $AppPool
-        Start-Sleep -Seconds 2
-    }
+    Stop-AppPoolAndWait -AppPool $AppPool
     try {
         New-Item -ItemType Directory -Path $SiteFolder -Force | Out-Null
         $rc = @($ArtifactDir, $SiteFolder, '/MIR','/NFL','/NDL','/NJH','/NJS','/NP','/R:2','/W:2')
@@ -133,12 +235,10 @@ function Deploy-Angular-IIS {
             robocopy $backup $SiteFolder /MIR /NFL /NDL /NJH /NJS /NP /R:2 /W:2 | Out-Null
             $global:LASTEXITCODE = 0
         }
-        Start-WebAppPool -Name $AppPool -ErrorAction SilentlyContinue
+        try { Start-AppPoolAndWait -AppPool $AppPool } catch { Write-Host "  (best-effort pool start: $($_.Exception.Message))" }
         throw
     }
-    Write-Host "Starting app pool '$AppPool'"
-    Start-WebAppPool -Name $AppPool
-    Start-Sleep -Seconds 2
+    Start-AppPoolAndWait -AppPool $AppPool
     Test-Smoke -Url $SmokeUrl -HostHeader $SmokeHostHeader
     Write-Host "Deploy-Angular-IIS complete for '$Name'."
 }
@@ -167,20 +267,14 @@ function Deploy-DotNetWebApp-IIS {
     $backupName = "$Name-bin"
     $backup = Backup-AppFolder -SiteFolder $siteBin -BackupRoot $BackupRoot -Name $backupName
     Rotate-Backups -BackupRoot $BackupRoot -Name $backupName -Keep $Retention
-    if ((Get-WebAppPoolState -Name $AppPool).Value -ne 'Stopped') {
-        Write-Host "Stopping app pool '$AppPool'"
-        Stop-WebAppPool -Name $AppPool
-        Start-Sleep -Seconds 2
-    }
+    Stop-AppPoolAndWait -AppPool $AppPool
     try {
         New-Item -ItemType Directory -Path $siteBin -Force | Out-Null
         Write-Host "Copy: '$ArtifactDir' -> '$siteBin' (additive, recursive, no purge)"
         robocopy $ArtifactDir $siteBin /E /NFL /NDL /NJH /NJS /NP /R:2 /W:2 | Out-Null
         if ($LASTEXITCODE -ge 8) { throw "robocopy deploy failed (exit $LASTEXITCODE)" }
         $global:LASTEXITCODE = 0
-        Write-Host "Starting app pool '$AppPool'"
-        Start-WebAppPool -Name $AppPool
-        Start-Sleep -Seconds 2
+        Start-AppPoolAndWait -AppPool $AppPool
         if ($SmokeBodyMatch) {
             Test-Smoke -Url $SmokeUrl -HostHeader $SmokeHostHeader -BodyMatch $SmokeBodyMatch
         } else {
@@ -197,13 +291,13 @@ function Deploy-DotNetWebApp-IIS {
         Write-Host "Deploy or smoke check failed: $($_.Exception.Message)"
         if ($backup) {
             Write-Host "Rolling back bin from '$backup' (stop pool, restore, restart pool)."
-            try { Stop-WebAppPool -Name $AppPool -ErrorAction Stop; Start-Sleep -Seconds 2 } catch { Write-Host "  (pool stop during rollback: $($_.Exception.Message))" }
+            try { Stop-AppPoolAndWait -AppPool $AppPool } catch { Write-Host "  (pool stop during rollback: $($_.Exception.Message))" }
             robocopy $backup $siteBin /MIR /NFL /NDL /NJH /NJS /NP /R:2 /W:2 | Out-Null
             $global:LASTEXITCODE = 0
-            try { Start-WebAppPool -Name $AppPool -ErrorAction Stop; Start-Sleep -Seconds 2 } catch { Write-Host "  (pool start during rollback: $($_.Exception.Message))" }
+            try { Start-AppPoolAndWait -AppPool $AppPool } catch { Write-Host "  (pool start during rollback: $($_.Exception.Message))" }
         } else {
             Write-Host "No backup available (first deploy?) - cannot roll back automatically."
-            Start-WebAppPool -Name $AppPool -ErrorAction SilentlyContinue
+            try { Start-AppPoolAndWait -AppPool $AppPool } catch { Write-Host "  (best-effort pool start: $($_.Exception.Message))" }
         }
         throw
     }
@@ -523,11 +617,7 @@ function Deploy-AspNetCore-IIS {
     $backup = Backup-AppFolder -SiteFolder $SiteFolder -BackupRoot $BackupRoot -Name $Name -ExcludeDirs $PreserveDirs
     Rotate-Backups -BackupRoot $BackupRoot -Name $Name -Keep $Retention
 
-    if ((Get-WebAppPoolState -Name $AppPool).Value -ne 'Stopped') {
-        Write-Host "Stopping app pool '$AppPool'"
-        Stop-WebAppPool -Name $AppPool
-        Start-Sleep -Seconds 2
-    }
+    Stop-AppPoolAndWait -AppPool $AppPool
 
     try {
         New-Item -ItemType Directory -Path $SiteFolder -Force | Out-Null
@@ -536,9 +626,7 @@ function Deploy-AspNetCore-IIS {
         if ($LASTEXITCODE -ge 8) { throw "robocopy deploy failed (exit $LASTEXITCODE)" }
         $global:LASTEXITCODE = 0
 
-        Write-Host "Starting app pool '$AppPool'"
-        Start-WebAppPool -Name $AppPool
-        Start-Sleep -Seconds 2
+        Start-AppPoolAndWait -AppPool $AppPool
 
         if ($SmokeBodyMatch) {
             Test-Smoke -Url $SmokeUrl -HostHeader $SmokeHostHeader -BodyMatch $SmokeBodyMatch
@@ -556,15 +644,15 @@ function Deploy-AspNetCore-IIS {
         Write-Host "Deploy or smoke check failed: $($_.Exception.Message)"
         if ($backup) {
             Write-Host "Rolling back site root from '$backup' (stop pool, restore, restart pool)."
-            try { Stop-WebAppPool -Name $AppPool -ErrorAction Stop; Start-Sleep -Seconds 2 } catch { Write-Host "  (pool stop during rollback: $($_.Exception.Message))" }
+            try { Stop-AppPoolAndWait -AppPool $AppPool } catch { Write-Host "  (pool stop during rollback: $($_.Exception.Message))" }
             $rc = @($backup, $SiteFolder, '/MIR','/NFL','/NDL','/NJH','/NJS','/NP','/R:2','/W:2')
             foreach ($d in $PreserveDirs) { $rc += '/XD'; $rc += (Join-Path $SiteFolder $d) }
             robocopy @rc | Out-Null
             $global:LASTEXITCODE = 0
-            try { Start-WebAppPool -Name $AppPool -ErrorAction Stop; Start-Sleep -Seconds 2 } catch { Write-Host "  (pool start during rollback: $($_.Exception.Message))" }
+            try { Start-AppPoolAndWait -AppPool $AppPool } catch { Write-Host "  (pool start during rollback: $($_.Exception.Message))" }
         } else {
             Write-Host "No backup available (first deploy?) - cannot roll back automatically."
-            Start-WebAppPool -Name $AppPool -ErrorAction SilentlyContinue
+            try { Start-AppPoolAndWait -AppPool $AppPool } catch { Write-Host "  (best-effort pool start: $($_.Exception.Message))" }
         }
         throw
     }
@@ -572,4 +660,4 @@ function Deploy-AspNetCore-IIS {
     Write-Host "Deploy-AspNetCore-IIS complete for '$Name'."
 }
 
-Export-ModuleMember -Function Backup-AppFolder, Rotate-Backups, Test-Smoke, Deploy-Angular-IIS, Deploy-DotNetWebApp-IIS, Deploy-AspNetCore-IIS, Deploy-DotnetConsole-Scheduled
+Export-ModuleMember -Function Backup-AppFolder, Rotate-Backups, Test-Smoke, Get-AppPoolStateSafe, Stop-AppPoolAndWait, Start-AppPoolAndWait, Deploy-Angular-IIS, Deploy-DotNetWebApp-IIS, Deploy-AspNetCore-IIS, Deploy-DotnetConsole-Scheduled
